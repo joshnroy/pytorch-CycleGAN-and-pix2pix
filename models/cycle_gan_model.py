@@ -3,6 +3,8 @@ import itertools
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
+import torch.nn.functional as F
+import torchvision
 
 
 class CycleGANModel(BaseModel):
@@ -96,6 +98,8 @@ class CycleGANModel(BaseModel):
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
+        self.batch_size = opt.batch_size
+
     def set_input(self, input):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
 
@@ -109,11 +113,19 @@ class CycleGANModel(BaseModel):
         self.real_B = input['B' if AtoB else 'A'].to(self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
+    def shift(self, imgs):
+        shifted_imgs = torch.zeros_like(imgs)
+        imgs_temp = imgs[:, :, self.shifts[0]:imgs.shape[2]+self.shifts[0], self.shifts[1]:imgs.shape[3]+self.shifts[1]]
+        shifted_imgs[:, :, :imgs_temp.shape[2], :imgs_temp.shape[3]] = imgs_temp
+        return shifted_imgs
+
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.fake_B = self.netG_A(self.real_A)  # G_A(A)
+        self.fake_B_shifted = self.netG_A(self.shift(self.real_A))
         self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A))
         self.fake_A = self.netG_B(self.real_B)  # G_B(B)
+        self.fake_A_shifted = self.netG_B(self.shift(self.real_B))
         self.rec_B = self.netG_A(self.fake_A)   # G_A(G_B(B))
 
     def backward_D_basic(self, netD, real, fake):
@@ -173,12 +185,20 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+
+        # Shift losses
+        lambda_shift = 1.
+        self.shift_A = lambda_shift * F.mse_loss(self.shift(self.fake_A), self.fake_A_shifted)
+        self.shift_B = lambda_shift * F.mse_loss(self.shift(self.fake_B), self.fake_B_shifted)
+
         # combined loss and calculate gradients
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B + self.shift_A + self.shift_B
         self.loss_G.backward()
 
     def optimize_parameters(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
+        # Shift
+        self.shifts = torch.randint(-10, 10, size=(2,), device=self.device)
         # forward
         self.forward()      # compute fake images and reconstruction images.
         # G_A and G_B
